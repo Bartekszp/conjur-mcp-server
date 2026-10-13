@@ -1,0 +1,25 @@
+# Binaries and build artifacts
+bin/*.exe
+bin/*.old
+bin/*~
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Environment variables & secrets
+.env
+.env.*
+*.key
+*.token
+
+# IDE and Editor files
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS artifacts
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store

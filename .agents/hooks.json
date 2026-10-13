@@ -1,0 +1,17 @@
+{
+  "mcp-only-gate": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "run_command|write_to_file|replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -Command \"$ErrorActionPreference='Stop'; @{decision='deny'; reason='DENIED: Agent is running in MCP-Only mode. File modification and shell command execution are blocked.'} | ConvertTo-Json -Compress\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
