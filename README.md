@@ -85,3 +85,39 @@ CONJUR_ACCOUNT="myorg"
 CONJUR_AUTHN_LOGIN="admin"
 CONJUR_AUTHN_API_KEY="<your-conjur-api-key>"
 ```
+
+### Running the Pre-Flight Check
+
+Verify that all containers and database connections are operational:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ./scripts/preflight.ps1
+```
+
+### Building and Running the MCP Server
+
+```bash
+# Build binary
+go build -o bin/conjur-mcp-server.exe main.go
+
+# Run with all tool modules enabled (default)
+./bin/conjur-mcp-server.exe --mode=all
+
+# Run specific modules only (e.g., DevEx and SecOps)
+./bin/conjur-mcp-server.exe --mode=devex,secops
+```
+
+---
+
+## Author & Maintainer
+
+* **Author:** [Your Name / Nickname]
+* **Focus:** Cloud Security / DevSecOps / Identity & Access Management (IAM)
+* **GitHub:** [@yourusername](https://github.com/yourusername)
+* **LinkedIn:** [Your Profile Link](https://linkedin.com/in/yourprofile)
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
