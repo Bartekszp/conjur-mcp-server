@@ -27,9 +27,16 @@ import (
 	"conjur-mcp-server/internal/conjur"
 )
 
-// --- Input Validation (Security Guardrails) ---
+// --- Input Validation & Redaction (Security Guardrails) ---
 
-var validIdentifierRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-\.\/]+$`)
+var (
+	validIdentifierRegex  = regexp.MustCompile(`^[a-zA-Z0-9_\-\.\/]+$`)
+	validQualifiedIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-\.\/:]+$`)
+	apiKeyRedactionRegex  = regexp.MustCompile(`(?i)"api_key"\s*:\s*"[^"]+"`)
+	yamlAnchorAliasRegex  = regexp.MustCompile(`(^|[\s,\[\{])([&*][a-zA-Z0-9_\-]+)`)
+	adminAbuseRegex       = regexp.MustCompile(`(?i)(!user\s+["']?admin["']?|id\s*:\s*["']?admin["']?|role\s*:\s*(!user\s+)?["']?admin["']?)`)
+	destructiveRegex      = regexp.MustCompile(`(?i)(update|replace|delete)`)
+)
 
 func validateIdentifier(val, fieldName string) error {
 	trimmed := strings.TrimSpace(val)
@@ -48,9 +55,33 @@ func validateIdentifier(val, fieldName string) error {
 	return nil
 }
 
+func validateQualifiedIdentifier(val, fieldName string) error {
+	trimmed := strings.TrimSpace(val)
+	if trimmed == "" {
+		return fmt.Errorf("field '%s' cannot be empty", fieldName)
+	}
+	if len(trimmed) > 256 {
+		return fmt.Errorf("field '%s' exceeds maximum length of 256 characters", fieldName)
+	}
+	if strings.Contains(trimmed, "..") {
+		return fmt.Errorf("field '%s' cannot contain path traversal sequences ('..')", fieldName)
+	}
+	if !validQualifiedIDRegex.MatchString(trimmed) {
+		return fmt.Errorf("field '%s' contains invalid characters: only alphanumeric characters and _, -, ., /, : are allowed", fieldName)
+	}
+	return nil
+}
+
+func marshalAndRedactPolicyResp(resp any) string {
+	respJSON, _ := json.MarshalIndent(resp, "", "  ")
+	return apiKeyRedactionRegex.ReplaceAllString(string(respJSON), `"api_key": "[REDACTED_NOT_EXPOSED_IN_CHAT]"`)
+}
+
 func generateSecurePassword(length int) (string, error) {
 	if length < 16 {
 		length = 32
+	} else if length > 256 {
+		length = 256
 	}
 	b := make([]byte, length)
 	if _, err := rand.Read(b); err != nil {
@@ -204,7 +235,7 @@ func (c *conjurClient) GetAPIKeyLastRotated(role string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, err := io.ReadAll(resp.Body)
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if err != nil {
 		return "", err
 	}
@@ -426,7 +457,7 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 	runTestTool := mcp.NewTool("run_test_with_secret",
 		mcp.WithDescription("Securely fetches a secret from Conjur and executes a test command with the secret injected as the APP_SECRET environment variable. Automatically redacts the secret from process output. Direct exfiltration commands (echo %APP_SECRET%, set, env, printenv) are strictly blocked by guardrails."),
 		mcp.WithString("variable_id", mcp.Required(), mcp.Description("Conjur variable ID (e.g., dev/billing/stripe-key)")),
-		mcp.WithString("command", mcp.Required(), mcp.Description("Test command or script to execute via cmd /c (e.g., 'python run_tests.py'). Constraints: commands attempting direct secret printing are rejected.")),
+		mcp.WithString("command", mcp.Required(), mcp.Description("Test command or script to execute (e.g., 'python run_tests.py'). Constraints: shell operators and commands attempting direct secret printing are rejected.")),
 	)
 	s.AddTool(runTestTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args, err := parseArgs[RunTestArgs](req)
@@ -437,14 +468,35 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// Security Guardrail: block direct environment dumping or printing commands
-		lowerCmd := strings.ToLower(strings.TrimSpace(args.Command))
-		if strings.Contains(lowerCmd, "%app_secret%") ||
-			strings.Contains(lowerCmd, "$app_secret") ||
-			strings.Contains(lowerCmd, "$env:app_secret") ||
-			lowerCmd == "set" || strings.HasPrefix(lowerCmd, "set ") ||
-			lowerCmd == "env" || lowerCmd == "printenv" {
-			return mcp.NewToolResultError("Execution rejected: Direct secret exfiltration or environment dumping attempt detected."), nil
+		trimmedCmd := strings.TrimSpace(args.Command)
+		if trimmedCmd == "" || len(trimmedCmd) > 512 {
+			return mcp.NewToolResultError("Validation error: 'command' must be between 1 and 512 characters."), nil
+		}
+
+		// Block shell metacharacters and command chaining
+		if strings.ContainsAny(trimmedCmd, ";|&><`\r\n$") {
+			return mcp.NewToolResultError("Execution rejected: Shell metacharacters and command chaining operators are strictly prohibited."), nil
+		}
+
+		// Security Guardrail: block direct environment dumping, inline code execution, or encoding/network exfiltration
+		lowerCmd := strings.ToLower(trimmedCmd)
+		blockedPatterns := []string{
+			"app_secret", "printenv", "base64", "certutil", "curl", "wget",
+			"invoke-webrequest", "invoke-restmethod", " -c ", " -e ", " /c ",
+		}
+		for _, pattern := range blockedPatterns {
+			if strings.Contains(lowerCmd, pattern) {
+				return mcp.NewToolResultError("Execution rejected: Direct secret exfiltration, inline script evaluation, or environment dumping attempt detected."), nil
+			}
+		}
+
+		cmdParts := strings.Fields(trimmedCmd)
+		if len(cmdParts) == 0 {
+			return mcp.NewToolResultError("Validation error: 'command' cannot be empty."), nil
+		}
+		baseBin := strings.ToLower(cmdParts[0])
+		if baseBin == "set" || baseBin == "env" || baseBin == "echo" || baseBin == "printf" || baseBin == "cat" || baseBin == "type" {
+			return mcp.NewToolResultError("Execution rejected: Direct environment or file dumping commands are not allowed."), nil
 		}
 
 		secretBytes, err := client.api.RetrieveSecret(args.VariableID)
@@ -453,13 +505,11 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 		}
 		secretVal := string(secretBytes)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		execCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 
-		cmd := exec.CommandContext(ctx, args.Command)
-		//cmd := exec.CommandContext(ctx, "cmd", "/C", args.Command)
+		cmd := exec.CommandContext(execCtx, cmdParts[0], cmdParts[1:]...)
 		cmd.Env = []string{fmt.Sprintf("APP_SECRET=%s", secretVal)}
-		//cmd.Env = append(os.Environ(), fmt.Sprintf("APP_SECRET=%s", secretVal))
 		output, err := cmd.CombinedOutput()
 
 		redact := func(s string) string {
@@ -470,7 +520,7 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 		}
 
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Test execution failed: %v\nOutput: %s", err, redact(string(output)))), nil
+			return mcp.NewToolResultError(fmt.Sprintf("Test execution failed: %s\nOutput: %s", redact(err.Error()), redact(string(output)))), nil
 		}
 
 		return mcp.NewToolResultText(fmt.Sprintf("Success:\n%s", redact(string(output)))), nil
@@ -487,6 +537,12 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Invalid arguments: %v", err)), nil
 		}
+		if args.Search != "" {
+			if err := validateIdentifier(args.Search, "search"); err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+		}
+
 		limit := args.Limit
 		if limit <= 0 || limit > 200 {
 			limit = 50
@@ -569,8 +625,8 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 			return mcp.NewToolResultError(fmt.Sprintf("Error creating variable: %v", err)), nil
 		}
 
-		respJSON, _ := json.MarshalIndent(resp, "", "  ")
-		return mcp.NewToolResultText(fmt.Sprintf("Variable '%s' was successfully created in branch '%s'.\n%s", args.VariableID, args.Branch, string(respJSON))), nil
+		safeResp := marshalAndRedactPolicyResp(resp)
+		return mcp.NewToolResultText(fmt.Sprintf("Variable '%s' was successfully created in branch '%s'.\n%s", args.VariableID, args.Branch, safeResp)), nil
 	})
 
 	// A4. Create and securely set random secret
@@ -597,7 +653,7 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 			}
 		}
 
-		// 1. Walidacja limitów długości (ochrona przed DoS / OOM)
+		// 1. Validate length limits (DoS / OOM protection)
 		length := args.Length
 		if length == 0 {
 			length = 32
@@ -605,12 +661,12 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 			return mcp.NewToolResultError("Validation error: 'length' must be between 16 and 256 bytes."), nil
 		}
 
-		// 2. Walidacja długości opisu
+		// 2. Validate description length
 		if len(args.Description) > 500 {
 			return mcp.NewToolResultError("Validation error: 'description' cannot exceed 500 characters."), nil
 		}
 
-		// 3. Normalizacja branch, varName i docelowego ID zmiennej
+		// 3. Normalize branch, varName, and targetVarID
 		branch := args.Branch
 		varName := args.VariableID
 		targetVarID := args.VariableID
@@ -634,18 +690,16 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 			}
 		}
 
-		// 4. Sprawdzenie czy zmienna już istnieje w Conjur
+		// 4. Check if variable already exists in Conjur
 		fullVarID := client.fullID("variable", targetVarID)
 		_, getErr := client.api.Resource(fullVarID)
 		createdPolicy := false
 
 		if getErr == nil {
-			// Zmienna istnieje - sprawdź flagę overwrite
 			if !args.Overwrite {
 				return mcp.NewToolResultError(fmt.Sprintf("Variable '%s' already exists. Pass 'overwrite: true' if you explicitly want to replace its secret value.", targetVarID)), nil
 			}
 		} else {
-			// Upewnij się, że błąd to faktycznie 404 Not Found
 			errStr := strings.ToLower(getErr.Error())
 			if !strings.Contains(errStr, "404") && !strings.Contains(errStr, "not found") {
 				return mcp.NewToolResultError(fmt.Sprintf("Error checking variable '%s' in Conjur: %v", targetVarID, getErr)), nil
@@ -653,7 +707,7 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 			createdPolicy = true
 		}
 
-		// 5. Deklaracja/aktualizacja polityki (z bezpiecznym escapowaniem YAML i last_rotated_at)
+		// 5. Declare/update policy with safe YAML quoting and last_rotated_at annotation
 		nowUTC := time.Now().UTC().Format(time.RFC3339)
 		yamlDef := fmt.Sprintf("- !variable\n  id: %s\n  annotations:\n    last_rotated_at: %s\n",
 			strconv.Quote(varName),
@@ -663,9 +717,6 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 			yamlDef += fmt.Sprintf("    description: %s\n", strconv.Quote(args.Description))
 		}
 
-		//if err := validatePolicyYAML(yamlDef); err != nil {
-		//	return mcp.NewToolResultError(fmt.Sprintf("Generated policy failed security validation: %v", err)), nil
-		//}
 		report := validatePolicyYAML(yamlDef)
 		if !report.Valid {
 			issues := strings.Join(report.SecurityIssues, "; ")
@@ -678,7 +729,7 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 			}
 		}
 
-		// 6. Generowanie i zapis sekretu z redagowaniem ewentualnych błędów (Zero-Leakage)
+		// 6. Generate and write secret with error redaction (Zero-Leakage)
 		secretVal, err := generateSecurePassword(length)
 		if err != nil {
 			return mcp.NewToolResultError("Failed to generate cryptographically secure secret."), nil
@@ -715,10 +766,23 @@ func validatePolicyYAML(content string) PolicyValidationReport {
 		SecurityIssues: []string{},
 	}
 
+	if len(content) > 65536 {
+		report.Valid = false
+		report.SecurityIssues = append(report.SecurityIssues, "Policy content exceeds maximum allowed size (64 KB)")
+		return report
+	}
+
 	trimmed := strings.TrimSpace(content)
 	if trimmed == "" {
 		report.Valid = false
 		report.SecurityIssues = append(report.SecurityIssues, "Policy content is empty")
+		return report
+	}
+
+	// Block YAML Bombs (anchors & and aliases *)
+	if yamlAnchorAliasRegex.MatchString(content) {
+		report.Valid = false
+		report.SecurityIssues = append(report.SecurityIssues, "YAML anchors (&) and aliases (*) are disallowed for security reasons")
 		return report
 	}
 
@@ -729,15 +793,14 @@ func validatePolicyYAML(content string) PolicyValidationReport {
 		return report
 	}
 
-	lower := strings.ToLower(content)
-
 	// Policy Security Guardrails
-	if strings.Contains(lower, "!user admin") || strings.Contains(lower, "role: admin") || strings.Contains(lower, "role: !user admin") {
+	if adminAbuseRegex.MatchString(content) {
 		report.Valid = false
 		report.SecurityIssues = append(report.SecurityIssues, "Critical: Modifying or granting permissions to the admin user ('admin') is strictly prohibited.")
 	}
 
-	if strings.Contains(lower, "privileges: [update, replace, delete]") && (strings.Contains(lower, "root") || strings.Contains(lower, "production")) {
+	lower := strings.ToLower(content)
+	if destructiveRegex.MatchString(lower) && (strings.Contains(lower, "root") || strings.Contains(lower, "production")) {
 		report.Warnings = append(report.Warnings, "Warning: Destructive privileges (update/replace/delete) declared in a critical branch (root/production).")
 	}
 
@@ -786,18 +849,19 @@ func registerPolicyTools(s *server.MCPServer, client *conjurClient) {
 
 		// Protect root and production branches from destructive replace mode
 		lowerMode := strings.ToLower(strings.TrimSpace(args.Mode))
-		lowerBranch := strings.ToLower(strings.TrimSpace(args.Branch))
-		if (lowerMode == "put" || lowerMode == "replace") && (lowerBranch == "root" || lowerBranch == "production") {
+		cleanBranch := strings.Trim(strings.ToLower(strings.TrimSpace(args.Branch)), "/")
+		if (lowerMode == "put" || lowerMode == "replace") && (cleanBranch == "root" || cleanBranch == "production" || strings.HasPrefix(cleanBranch, "production/")) {
 			return mcp.NewToolResultError("Refusal: Replacing (mode=put/replace) branch 'root' or 'production' is blocked for security reasons. Use 'post' or 'patch' mode."), nil
 		}
 
-		resp, err := client.api.LoadPolicy(policyMode(args.Mode), args.Branch, strings.NewReader(args.YAMLContent))
+		resp, err := client.api.LoadPolicy(policyMode(args.Mode), cleanBranch, strings.NewReader(args.YAMLContent))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Error loading policy: %v", err)), nil
 		}
 
-		respJSON, _ := json.MarshalIndent(resp, "", "  ")
-		return mcp.NewToolResultText(fmt.Sprintf("Conjur response:\n%s", string(respJSON))), nil
+		// Redact any newly created host/user API keys from response
+		safeResp := marshalAndRedactPolicyResp(resp)
+		return mcp.NewToolResultText(fmt.Sprintf("Conjur response:\n%s", safeResp)), nil
 	})
 
 	// B3. Check permission
@@ -811,6 +875,15 @@ func registerPolicyTools(s *server.MCPServer, client *conjurClient) {
 		args, err := parseArgs[CheckPermissionArgs](req)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Invalid arguments: %v", err)), nil
+		}
+		if err := validateQualifiedIdentifier(args.Role, "role"); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if err := validateIdentifier(args.Privilege, "privilege"); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if err := validateQualifiedIdentifier(args.Resource, "resource"); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
 		}
 
 		// Normalize resource identifier to account:kind:id
@@ -856,6 +929,16 @@ func registerPolicyTools(s *server.MCPServer, client *conjurClient) {
 		args, err := parseArgs[GetResourceTreeArgs](req)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Invalid arguments: %v", err)), nil
+		}
+		if args.Branch != "" {
+			if err := validateIdentifier(args.Branch, "branch"); err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+		}
+		if args.Kind != "" {
+			if err := validateIdentifier(args.Kind, "kind"); err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
 		}
 
 		limit := args.Limit
@@ -932,6 +1015,12 @@ func registerSecOpsTools(s *server.MCPServer, client *conjurClient) {
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Invalid arguments: %v", err)), nil
 		}
+		if args.Search != "" {
+			if err := validateIdentifier(args.Search, "search"); err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+		}
+
 		maxDays := args.MaxAgeDays
 		if maxDays <= 0 {
 			maxDays = 90
@@ -1066,6 +1155,9 @@ func registerSecOpsTools(s *server.MCPServer, client *conjurClient) {
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Invalid arguments: %v", err)), nil
 		}
+		if err := validateQualifiedIdentifier(args.RoleID, "role_id"); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 
 		parts := strings.SplitN(args.RoleID, ":", 2)
 		kind := "host"
@@ -1105,8 +1197,8 @@ func registerSecOpsTools(s *server.MCPServer, client *conjurClient) {
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Invalid arguments: %v", err)), nil
 		}
-		if strings.TrimSpace(args.Role) == "" {
-			return mcp.NewToolResultError("Field 'role' cannot be empty"), nil
+		if err := validateQualifiedIdentifier(args.Role, "role"); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
 		}
 
 		lastRotated, err := client.GetAPIKeyLastRotated(args.Role)
@@ -1140,15 +1232,14 @@ func registerOnboardingTools(s *server.MCPServer, client *conjurClient) {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		yamlDef := fmt.Sprintf("- !host %s\n", args.HostID)
+		yamlDef := fmt.Sprintf("- !host %s\n", strconv.Quote(args.HostID))
 		resp, err := client.api.LoadPolicy(conjurapi.PolicyModePost, args.Branch, strings.NewReader(yamlDef))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Error creating host: %v", err)), nil
 		}
 
 		// Secure serialization: mask API keys from Conjur response
-		respJSON, _ := json.Marshal(resp)
-		safeResp := regexp.MustCompile(`"api_key"\s*:\s*"[^"]+"`).ReplaceAllString(string(respJSON), `"api_key":"[REDACTED_NOT_EXPOSED_IN_CHAT]"`)
+		safeResp := marshalAndRedactPolicyResp(resp)
 
 		return mcp.NewToolResultText(fmt.Sprintf("Host '%s' was registered in branch '%s'.\nThe API key has been redacted and is not displayed in chat. Use a secure bootstrap mechanism for CI/CD.\nConjur result:\n%s", args.HostID, args.Branch, safeResp)), nil
 	})
@@ -1169,14 +1260,24 @@ func registerOnboardingTools(s *server.MCPServer, client *conjurClient) {
 
 		// SDK RotateAPIKey accepts role in "host:<id>" format (PUT /authn/:account/api_key)
 		newKeyBytes, err := client.api.RotateAPIKey("host:" + args.HostID)
+		keyLen := len(newKeyBytes)
+		newKeyStr := string(newKeyBytes)
+		for i := range newKeyBytes {
+			newKeyBytes[i] = 0
+		}
+
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Error rotating API key for host '%s': %v", args.HostID, err)), nil
+			safeErr := err.Error()
+			if newKeyStr != "" {
+				safeErr = strings.ReplaceAll(safeErr, newKeyStr, "[REDACTED]")
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("Error rotating API key for host '%s': %s", args.HostID, safeErr)), nil
 		}
 
 		// Verify new rotation timestamp from native endpoint
 		lastRotated, _ := client.GetAPIKeyLastRotated(client.fullID("host", args.HostID))
 
-		msg := fmt.Sprintf("Success: API key for host '%s' was successfully rotated (key length: %d chars). In accordance with security policy, the raw key is not displayed in the chat window.", args.HostID, len(newKeyBytes))
+		msg := fmt.Sprintf("Success: API key for host '%s' was successfully rotated (key length: %d chars). In accordance with security policy, the raw key is not displayed in the chat window.", args.HostID, keyLen)
 		if lastRotated != "" {
 			msg += fmt.Sprintf(" New rotation timestamp from Conjur: %s.", lastRotated)
 		}
@@ -1201,6 +1302,9 @@ func registerOnboardingTools(s *server.MCPServer, client *conjurClient) {
 		}
 		if err := validateIdentifier(args.Branch, "branch"); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if len(args.AccessibleVariables) > 100 {
+			return mcp.NewToolResultError("Validation error: 'accessible_variables' cannot exceed 100 items."), nil
 		}
 
 		var sb strings.Builder
