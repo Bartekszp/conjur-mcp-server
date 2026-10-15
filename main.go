@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,6 +35,12 @@ func validateIdentifier(val, fieldName string) error {
 	trimmed := strings.TrimSpace(val)
 	if trimmed == "" {
 		return fmt.Errorf("field '%s' cannot be empty", fieldName)
+	}
+	if len(trimmed) > 256 {
+		return fmt.Errorf("field '%s' exceeds maximum length of 256 characters", fieldName)
+	}
+	if strings.Contains(trimmed, "..") {
+		return fmt.Errorf("field '%s' cannot contain path traversal sequences ('..')", fieldName)
 	}
 	if !validIdentifierRegex.MatchString(trimmed) {
 		return fmt.Errorf("field '%s' contains invalid characters: only alphanumeric characters and _, -, ., / are allowed", fieldName)
@@ -76,6 +83,7 @@ type CreateAndSetSecretArgs struct {
 	Branch      string `json:"branch,omitempty"`
 	Description string `json:"description,omitempty"`
 	Length      int    `json:"length,omitempty"`
+	Overwrite   bool   `json:"overwrite"`
 }
 
 // Policy DTOs
@@ -541,10 +549,19 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 		if err := validateIdentifier(args.VariableID, "variable_id"); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		if len(args.Description) > 500 {
+			return mcp.NewToolResultError("Validation error: 'description' cannot exceed 500 characters."), nil
+		}
 
-		yamlDef := fmt.Sprintf("- !variable\n  id: %s\n", args.VariableID)
+		yamlDef := fmt.Sprintf("- !variable\n  id: %s\n", strconv.Quote(args.VariableID))
 		if args.Description != "" {
-			yamlDef += fmt.Sprintf("  annotations:\n    description: %s\n", strings.ReplaceAll(args.Description, "\n", " "))
+			yamlDef += fmt.Sprintf("  annotations:\n    description: %s\n", strconv.Quote(args.Description))
+		}
+
+		report := validatePolicyYAML(yamlDef)
+		if !report.Valid {
+			issues := strings.Join(report.SecurityIssues, "; ")
+			return mcp.NewToolResultError(fmt.Sprintf("Generated policy failed security validation: %s", issues)), nil
 		}
 
 		resp, err := client.api.LoadPolicy(conjurapi.PolicyModePost, args.Branch, strings.NewReader(yamlDef))
@@ -562,8 +579,10 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 		mcp.WithString("variable_id", mcp.Required(), mcp.Description("Full Conjur variable ID (e.g., dev/billing/db-password)")),
 		mcp.WithString("branch", mcp.Description("Optional target branch (automatically derived from variable_id if omitted, e.g., dev/billing)")),
 		mcp.WithString("description", mcp.Description("Optional description of the secret's purpose")),
-		mcp.WithInteger("length", mcp.Description("Byte length of the generated random secret (default: 32, min: 16)")),
+		mcp.WithInteger("length", mcp.Description("Byte length of the generated random secret (default: 32, min: 16, max: 256)")),
+		mcp.WithBoolean("overwrite", mcp.Description("Set to true to allow overwriting an existing variable's secret value (default: false)")),
 	)
+
 	s.AddTool(createSecretTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args, err := parseArgs[CreateAndSetSecretArgs](req)
 		if err != nil {
@@ -578,64 +597,105 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 			}
 		}
 
+		// 1. Walidacja limitów długości (ochrona przed DoS / OOM)
 		length := args.Length
-		if length < 16 {
+		if length == 0 {
 			length = 32
+		} else if length < 16 || length > 256 {
+			return mcp.NewToolResultError("Validation error: 'length' must be between 16 and 256 bytes."), nil
 		}
 
-		secretVal, err := generateSecurePassword(length)
-		if err != nil {
-			return mcp.NewToolResultError("Failed to generate secure password"), nil
+		// 2. Walidacja długości opisu
+		if len(args.Description) > 500 {
+			return mcp.NewToolResultError("Validation error: 'description' cannot exceed 500 characters."), nil
 		}
 
-		// 1. Check if variable already exists in Conjur
-		fullVarID := client.fullID("variable", args.VariableID)
+		// 3. Normalizacja branch, varName i docelowego ID zmiennej
+		branch := args.Branch
+		varName := args.VariableID
+		targetVarID := args.VariableID
+
+		if branch == "" {
+			if lastSlash := strings.LastIndex(args.VariableID, "/"); lastSlash != -1 {
+				branch = args.VariableID[:lastSlash]
+				varName = args.VariableID[lastSlash+1:]
+			} else {
+				branch = "root"
+			}
+		} else {
+			if strings.HasPrefix(varName, branch+"/") {
+				varName = strings.TrimPrefix(varName, branch+"/")
+			} else if !strings.Contains(varName, "/") {
+				if branch != "root" {
+					targetVarID = branch + "/" + varName
+				}
+			} else {
+				return mcp.NewToolResultError(fmt.Sprintf("Conflict: 'variable_id' (%s) does not match the specified 'branch' (%s).", args.VariableID, branch)), nil
+			}
+		}
+
+		// 4. Sprawdzenie czy zmienna już istnieje w Conjur
+		fullVarID := client.fullID("variable", targetVarID)
 		_, getErr := client.api.Resource(fullVarID)
 		createdPolicy := false
 
-		// 2. If variable does not exist, declare it in policy first
-		if getErr != nil {
-			branch := args.Branch
-			varName := args.VariableID
-
-			if branch == "" {
-				lastSlash := strings.LastIndex(args.VariableID, "/")
-				if lastSlash != -1 {
-					branch = args.VariableID[:lastSlash]
-					varName = args.VariableID[lastSlash+1:]
-				} else {
-					branch = "root"
-				}
-			} else {
-				if strings.HasPrefix(varName, branch+"/") {
-					varName = strings.TrimPrefix(varName, branch+"/")
-				} else if lastSlash := strings.LastIndex(varName, "/"); lastSlash != -1 {
-					varName = varName[lastSlash+1:]
-				}
+		if getErr == nil {
+			// Zmienna istnieje - sprawdź flagę overwrite
+			if !args.Overwrite {
+				return mcp.NewToolResultError(fmt.Sprintf("Variable '%s' already exists. Pass 'overwrite: true' if you explicitly want to replace its secret value.", targetVarID)), nil
 			}
-
-			yamlDef := fmt.Sprintf("- !variable\n  id: %s\n", varName)
-			if args.Description != "" {
-				yamlDef += fmt.Sprintf("  annotations:\n    description: %s\n", strings.ReplaceAll(args.Description, "\n", " "))
-			}
-
-			if _, loadErr := client.api.LoadPolicy(conjurapi.PolicyModePost, branch, strings.NewReader(yamlDef)); loadErr != nil {
-				if _, nativeErr := client.native.LoadPolicy(ctx, branch, "post", yamlDef); nativeErr != nil {
-					return mcp.NewToolResultError(fmt.Sprintf("Variable '%s' does not exist in Conjur and automatic policy declaration in branch '%s' failed: %v (fallback: %v)", args.VariableID, branch, loadErr, nativeErr)), nil
-				}
+		} else {
+			// Upewnij się, że błąd to faktycznie 404 Not Found
+			errStr := strings.ToLower(getErr.Error())
+			if !strings.Contains(errStr, "404") && !strings.Contains(errStr, "not found") {
+				return mcp.NewToolResultError(fmt.Sprintf("Error checking variable '%s' in Conjur: %v", targetVarID, getErr)), nil
 			}
 			createdPolicy = true
 		}
 
-		// 3. Write generated secret to Conjur
-		if err := client.api.AddSecret(args.VariableID, secretVal); err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Error writing secret value to Conjur: %v", err)), nil
+		// 5. Deklaracja/aktualizacja polityki (z bezpiecznym escapowaniem YAML i last_rotated_at)
+		nowUTC := time.Now().UTC().Format(time.RFC3339)
+		yamlDef := fmt.Sprintf("- !variable\n  id: %s\n  annotations:\n    last_rotated_at: %s\n",
+			strconv.Quote(varName),
+			strconv.Quote(nowUTC),
+		)
+		if args.Description != "" {
+			yamlDef += fmt.Sprintf("    description: %s\n", strconv.Quote(args.Description))
+		}
+
+		//if err := validatePolicyYAML(yamlDef); err != nil {
+		//	return mcp.NewToolResultError(fmt.Sprintf("Generated policy failed security validation: %v", err)), nil
+		//}
+		report := validatePolicyYAML(yamlDef)
+		if !report.Valid {
+			issues := strings.Join(report.SecurityIssues, "; ")
+			return mcp.NewToolResultError(fmt.Sprintf("Generated policy failed security validation: %s", issues)), nil
+		}
+
+		if _, loadErr := client.api.LoadPolicy(conjurapi.PolicyModePost, branch, strings.NewReader(yamlDef)); loadErr != nil {
+			if _, nativeErr := client.native.LoadPolicy(ctx, branch, "post", yamlDef); nativeErr != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("Policy declaration in branch '%s' failed: %v (fallback: %v)", branch, loadErr, nativeErr)), nil
+			}
+		}
+
+		// 6. Generowanie i zapis sekretu z redagowaniem ewentualnych błędów (Zero-Leakage)
+		secretVal, err := generateSecurePassword(length)
+		if err != nil {
+			return mcp.NewToolResultError("Failed to generate cryptographically secure secret."), nil
+		}
+
+		if err := client.api.AddSecret(targetVarID, secretVal); err != nil {
+			safeErr := err.Error()
+			if secretVal != "" {
+				safeErr = strings.ReplaceAll(safeErr, secretVal, "[REDACTED]")
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("Error writing secret value to Conjur: %s", safeErr)), nil
 		}
 
 		if createdPolicy {
-			return mcp.NewToolResultText(fmt.Sprintf("Success: Variable '%s' was automatically declared in Conjur policy and its value was generated (%d bytes of entropy) and securely stored without being exposed in chat.", args.VariableID, length)), nil
+			return mcp.NewToolResultText(fmt.Sprintf("Success: Variable '%s' was declared in Conjur policy and its value was generated (%d bytes of entropy) and securely stored without being exposed in chat.", targetVarID, length)), nil
 		}
-		return mcp.NewToolResultText(fmt.Sprintf("Success: Value for existing variable '%s' was successfully generated (%d bytes of entropy) and updated in Conjur without being exposed in chat.", args.VariableID, length)), nil
+		return mcp.NewToolResultText(fmt.Sprintf("Success: Value for existing variable '%s' was overwritten (%d bytes of entropy) and securely updated in Conjur without being exposed in chat.", targetVarID, length)), nil
 	})
 }
 
@@ -920,7 +980,7 @@ func registerSecOpsTools(s *server.MCPServer, client *conjurClient) {
 	rotateSecretTool := mcp.NewTool("rotate_secret",
 		mcp.WithDescription("Securely rotates a secret value: generates a new cryptographically secure random value and updates Conjur without revealing it in chat."),
 		mcp.WithString("variable_id", mcp.Required(), mcp.Description("Variable ID to rotate")),
-		mcp.WithInteger("length", mcp.Description("Byte length of the new secret (default: 32, min: 16)")),
+		mcp.WithInteger("length", mcp.Description("Byte length of the new secret (default: 32, min: 16, max: 256)")),
 	)
 	s.AddTool(rotateSecretTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args, err := parseArgs[RotateSecretArgs](req)
@@ -932,17 +992,23 @@ func registerSecOpsTools(s *server.MCPServer, client *conjurClient) {
 		}
 
 		length := args.Length
-		if length < 16 {
+		if length == 0 {
 			length = 32
+		} else if length < 16 || length > 256 {
+			return mcp.NewToolResultError("Validation error: 'length' must be between 16 and 256 bytes."), nil
 		}
 
 		newVal, err := generateSecurePassword(length)
 		if err != nil {
-			return mcp.NewToolResultError("Failed to generate secure password"), nil
+			return mcp.NewToolResultError("Failed to generate cryptographically secure secret."), nil
 		}
 
 		if err := client.api.AddSecret(args.VariableID, newVal); err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("Error rotating secret in Conjur: %v", err)), nil
+			safeErr := err.Error()
+			if newVal != "" {
+				safeErr = strings.ReplaceAll(safeErr, newVal, "[REDACTED]")
+			}
+			return mcp.NewToolResultError(fmt.Sprintf("Error rotating secret in Conjur: %s", safeErr)), nil
 		}
 
 		return mcp.NewToolResultText(fmt.Sprintf("Success: Variable '%s' value was successfully rotated (%d bytes of entropy) in Conjur. The new value was not exposed in chat.", args.VariableID, length)), nil
@@ -1149,6 +1215,9 @@ func registerOnboardingTools(s *server.MCPServer, client *conjurClient) {
 			for _, v := range args.AccessibleVariables {
 				cleanV := strings.TrimSpace(v)
 				if cleanV != "" {
+					if err := validateIdentifier(cleanV, "accessible_variables item"); err != nil {
+						return mcp.NewToolResultError(err.Error()), nil
+					}
 					sb.WriteString(fmt.Sprintf("  - !variable %s\n", cleanV))
 				}
 			}
