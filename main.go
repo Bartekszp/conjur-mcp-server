@@ -153,6 +153,7 @@ type ListRotationArgs struct {
 type RotateSecretArgs struct {
 	VariableID string `json:"variable_id"`
 	Length     int    `json:"length,omitempty"`
+	Confirm    bool   `json:"confirm"`
 }
 
 type HostOnlyArgs struct {
@@ -170,7 +171,8 @@ type CreateHostArgs struct {
 }
 
 type RotateHostAPIKeyArgs struct {
-	HostID string `json:"host_id"`
+	HostID  string `json:"host_id"`
+	Confirm bool   `json:"confirm"`
 }
 
 type PrepareWorkloadPolicyArgs struct {
@@ -1067,9 +1069,10 @@ func registerSecOpsTools(s *server.MCPServer, client *conjurClient) {
 
 	// C3. Rotate secret
 	rotateSecretTool := mcp.NewTool("rotate_secret",
-		mcp.WithDescription("Securely rotates a secret value: generates a new cryptographically secure random value and updates Conjur without revealing it in chat."),
+		mcp.WithDescription("Securely rotates a secret value: generates a new cryptographically secure random value and updates Conjur without revealing it in chat. Requires confirm: true."),
 		mcp.WithString("variable_id", mcp.Required(), mcp.Description("Variable ID to rotate")),
-		mcp.WithInteger("length", mcp.Description("Byte length of the new secret (default: 32, min: 16, max: 256)")),
+		mcp.WithInteger("length", mcp.Description("Byte length of the new secret (default: 32, min: 16)")),
+		mcp.WithBoolean("confirm", mcp.Description("Must be set to true to confirm rotation and prevent accidental execution.")),
 	)
 	s.AddTool(rotateSecretTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args, err := parseArgs[RotateSecretArgs](req)
@@ -1078,6 +1081,11 @@ func registerSecOpsTools(s *server.MCPServer, client *conjurClient) {
 		}
 		if err := validateIdentifier(args.VariableID, "variable_id"); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		// Sprawdzenie czy użytkownik/model potwierdził operację
+		if !args.Confirm {
+			return mcp.NewToolResultError(fmt.Sprintf("Refusal: Rotating secret for '%s' is a destructive operation. Please explicitly ask the user for confirmation and retry with 'confirm: true'.", args.VariableID)), nil
 		}
 
 		length := args.Length
@@ -1246,8 +1254,9 @@ func registerOnboardingTools(s *server.MCPServer, client *conjurClient) {
 
 	// D2. Rotate host API key
 	rotateHostKeyTool := mcp.NewTool("rotate_host_api_key",
-		mcp.WithDescription("Rotates a host API key in Conjur via PUT /authn/:account/api_key. The new key is securely masked and not displayed in chat history."),
+		mcp.WithDescription("Rotates a host API key in Conjur via PUT /authn/:account/api_key. Requires confirm: true. The new key is securely masked and not displayed in chat history."),
 		mcp.WithString("host_id", mcp.Required(), mcp.Description("Host identifier (e.g., test-host-1)")),
+		mcp.WithBoolean("confirm", mcp.Description("Must be set to true to confirm host API key rotation and prevent accidental execution.")),
 	)
 	s.AddTool(rotateHostKeyTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args, err := parseArgs[RotateHostAPIKeyArgs](req)
@@ -1256,6 +1265,11 @@ func registerOnboardingTools(s *server.MCPServer, client *conjurClient) {
 		}
 		if err := validateIdentifier(args.HostID, "host_id"); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		// Wymóg potwierdzenia operacji
+		if !args.Confirm {
+			return mcp.NewToolResultError(fmt.Sprintf("Refusal: Rotating API key for host '%s' is a destructive operation. Please explicitly ask the user for confirmation and retry with 'confirm: true'.", args.HostID)), nil
 		}
 
 		// SDK RotateAPIKey accepts role in "host:<id>" format (PUT /authn/:account/api_key)
