@@ -445,8 +445,13 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 		}
 		secretVal := string(secretBytes)
 
-		cmd := exec.CommandContext(ctx, "cmd", "/C", args.Command)
-		cmd.Env = append(os.Environ(), fmt.Sprintf("APP_SECRET=%s", secretVal))
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, args.Command)
+		//cmd := exec.CommandContext(ctx, "cmd", "/C", args.Command)
+		cmd.Env = []string{fmt.Sprintf("APP_SECRET=%s", secretVal)}
+		//cmd.Env = append(os.Environ(), fmt.Sprintf("APP_SECRET=%s", secretVal))
 		output, err := cmd.CombinedOutput()
 
 		redact := func(s string) string {
@@ -977,8 +982,8 @@ func registerSecOpsTools(s *server.MCPServer, client *conjurClient) {
 		apiKeyLastRotated, _ := client.GetAPIKeyLastRotated(client.fullID("host", args.HostID))
 
 		result := map[string]any{
-			"metadata":              meta,
-			"memberships":           memberList,
+			"metadata":             meta,
+			"memberships":          memberList,
 			"api_key_last_rotated": apiKeyLastRotated,
 		}
 		outJSON, _ := json.MarshalIndent(result, "", "  ")

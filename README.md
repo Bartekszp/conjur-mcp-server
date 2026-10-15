@@ -114,7 +114,7 @@ go build -o bin/conjur-mcp-server.exe main.go
 * **Author:** Bartek Szpargała
 * **Focus:** Cloud Security / DevSecOps / Identity & Access Management (IAM)
 * **GitHub:** [@Bartekszp](https://github.com/Bartekszp)
-* **LinkedIn:** [Your Profile Link](https://linkedin.com/in/yourprofile)
+* **LinkedIn:** [Your Profile Link](https://linkedin.com/in/bartek-szpargala)
 
 ---
 
