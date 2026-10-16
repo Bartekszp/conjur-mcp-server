@@ -30,6 +30,47 @@ This MCP server enforces strict enterprise guardrails to prevent credential expo
 
 ---
 
+## Known Limitations & Roadmap: Two-Step Confirmation Gate
+
+### The LLM Boolean Bypass Problem
+Currently, destructive tools (`rotate_secret`, `rotate_host_api_key`, and `create_and_set_secret` when overwriting existing variables) rely on boolean parameters (`confirm: bool` / `overwrite: bool`) and prompt instructions in the MCP tool description to request user consent.
+
+In practice, **AI agents frequently bypass boolean confirmation flags on the first call**. Because the user's initial prompt asks to rotate or update a secret, the LLM infers intent and automatically sets `confirm: true` in its very first tool invocation without pausing to ask the user in chat.
+
+### How to Implement Hard Enforcement (Challenge-Response Pattern)
+Because MCP communicates over `stdio` JSON-RPC, interactive terminal prompts (`fmt.Scanln`) cannot be used. To strictly force the AI agent to pause and ask the user in chat, replace the boolean flag with a **server-side, two-step Challenge-Response token**:
+
+1. **Change the DTO and Tool Parameter:** Replace `Confirm bool` with `ConfirmationToken string` (`confirmation_token`).
+2. **Generate a Short-Lived Token in Memory:** On the first tool call (when `confirmation_token` is empty), the server aborts execution, generates a random 4-character hex code (e.g., `A7F2`), stores it in an in-memory map (`pendingConfirmations[actionKey] = token`), and returns a tool error instructing the LLM to ask the user for that exact code.
+3. **Verify on Second Call:** Since the LLM cannot guess a cryptographically random token on the first turn, it is forced to stop and display the code to the user. Once the user replies with confirmation, the LLM passes the token in the second call, unlocking the operation.
+
+```go
+var pendingConfirmations = make(map[string]string)
+
+func verifyConfirmationToken(actionKey, providedToken, questionPrompt string) (bool, string) {
+	expectedToken, exists := pendingConfirmations[actionKey]
+	cleanedProvided := strings.TrimSpace(strings.ToUpper(providedToken))
+
+	if exists && expectedToken != "" && cleanedProvided == expectedToken {
+		delete(pendingConfirmations, actionKey)
+		return true, ""
+	}
+
+	b := make([]byte, 2)
+	_, _ = rand.Read(b)
+	newToken := strings.ToUpper(hex.EncodeToString(b))
+	pendingConfirmations[actionKey] = newToken
+
+	msg := fmt.Sprintf(
+		"CONFIRMATION REQUIRED: Stop and ask the user in chat: \"%s To confirm, reply with code: %s\".",
+		questionPrompt, newToken,
+	)
+	return false, msg
+}
+```
+
+---
+
 ## Pre-Flight Environment & Identity Verification
 
 The `./scripts/preflight.ps1` script validates environment health and authentication readiness before running MCP operations or tests:
@@ -105,6 +146,9 @@ go build -o bin/conjur-mcp-server.exe main.go
 
 # Run specific modules only (e.g., DevEx and SecOps)
 ./bin/conjur-mcp-server.exe --mode=devex,secops
+
+# Run security unit test suite
+go test -v .
 ```
 
 ---
