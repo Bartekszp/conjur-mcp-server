@@ -1,13 +1,13 @@
 {
   "mcpServers": {
     "conjur-full": {
-      "command": "C:\\Users\\szpargalab\\Desktop\\conjur-mcp-server\\bin\\conjur-mcp-server.exe",
+      "command": "C:\\Users\\szpargalab\\Desktop\\conjur-mcp-server\\bin\\conjur-mcp-server.exe", // Put your absolute path to the compiled MCP server binary here
       "args": ["--mode=all"],
       "env": {
         "CONJUR_APPLIANCE_URL": "http://localhost:8080",
-        "CONJUR_ACCOUNT": "myorg",
-        "CONJUR_AUTHN_LOGIN": "host/mcp-system/bridge-runner",
-        "CONJUR_AUTHN_API_KEY": "23s30bn1rz0brn30hsy31kde0g6jj5syp1zh55z12zddvdf37rxx0e"
+        "CONJUR_ACCOUNT": "myorg", // Put your Conjur account here
+        "CONJUR_AUTHN_LOGIN": "host/mcp-system/bridge-runner", // Put your Conjur login here
+        "CONJUR_AUTHN_API_KEY": "23s30bn1rz0brn30hsy31kde0g6jj5syp1zh55z12zddvdf37rxx0e" // Put your Conjur API key here
       }
     }
   }
