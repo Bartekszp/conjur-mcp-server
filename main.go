@@ -638,7 +638,7 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 		mcp.WithString("branch", mcp.Description("Optional target branch (automatically derived from variable_id if omitted, e.g., dev/billing)")),
 		mcp.WithString("description", mcp.Description("Optional description of the secret's purpose")),
 		mcp.WithInteger("length", mcp.Description("Byte length of the generated random secret (default: 32, min: 16, max: 256)")),
-		mcp.WithBoolean("overwrite", mcp.Description("Set to true to allow overwriting an existing variable's secret value (default: false)")),
+		mcp.WithBoolean("overwrite", mcp.Description("CRITICAL RULE: Always pass 'false' (or omit) on the first call. If the variable already exists, you MUST first ask the user in chat: 'Are you aware of the consequences of overwriting this secret? Reply yes to confirm.' Only set this to 'true' AFTER the user explicitly replies 'yes' in their next message.")),
 	)
 
 	s.AddTool(createSecretTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -699,7 +699,7 @@ func registerDevExTools(s *server.MCPServer, client *conjurClient) {
 
 		if getErr == nil {
 			if !args.Overwrite {
-				return mcp.NewToolResultError(fmt.Sprintf("Variable '%s' already exists. Pass 'overwrite: true' if you explicitly want to replace its secret value.", targetVarID)), nil
+				return mcp.NewToolResultError(fmt.Sprintf("CONFIRMATION REQUIRED: Variable '%s' already exists. Stop and ask the user in chat: 'Are you aware of the consequences of overwriting the secret for %s? Please reply yes to confirm.' Do NOT call this tool with 'overwrite: true' until the user explicitly replies 'yes'.", targetVarID, targetVarID)), nil
 			}
 		} else {
 			errStr := strings.ToLower(getErr.Error())
@@ -1069,10 +1069,10 @@ func registerSecOpsTools(s *server.MCPServer, client *conjurClient) {
 
 	// C3. Rotate secret
 	rotateSecretTool := mcp.NewTool("rotate_secret",
-		mcp.WithDescription("Securely rotates a secret value: generates a new cryptographically secure random value and updates Conjur without revealing it in chat. Requires confirm: true."),
+		mcp.WithDescription("Securely rotates a secret value: generates a new cryptographically secure random value and updates Conjur without revealing it in chat. Always requires explicit user confirmation first."),
 		mcp.WithString("variable_id", mcp.Required(), mcp.Description("Variable ID to rotate")),
-		mcp.WithInteger("length", mcp.Description("Byte length of the new secret (default: 32, min: 16)")),
-		mcp.WithBoolean("confirm", mcp.Description("Must be set to true to confirm rotation and prevent accidental execution.")),
+		mcp.WithInteger("length", mcp.Description("Byte length of the new secret (default: 32, min: 16, max: 256)")),
+		mcp.WithBoolean("confirm", mcp.Description("CRITICAL RULE: Always pass 'false' (or omit) on the first call. Never set this to 'true' automatically. You MUST first ask the user in chat: 'Are you aware of the consequences of rotating this key? Reply yes to confirm.' Only pass 'true' AFTER the user explicitly replies 'yes' in their next message.")),
 	)
 	s.AddTool(rotateSecretTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args, err := parseArgs[RotateSecretArgs](req)
@@ -1083,9 +1083,9 @@ func registerSecOpsTools(s *server.MCPServer, client *conjurClient) {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// Sprawdzenie czy użytkownik/model potwierdził operację
+		// Require explicit user confirmation before rotating the secret
 		if !args.Confirm {
-			return mcp.NewToolResultError(fmt.Sprintf("Refusal: Rotating secret for '%s' is a destructive operation. Please explicitly ask the user for confirmation and retry with 'confirm: true'.", args.VariableID)), nil
+			return mcp.NewToolResultError(fmt.Sprintf("CONFIRMATION REQUIRED: Rotating secret for '%s' is a destructive operation that will invalidate the current key. Stop and ask the user in chat: 'Are you aware of the consequences of rotating the key for %s? Please reply yes to confirm.' Do NOT call this tool with 'confirm: true' until the user explicitly replies 'yes'.", args.VariableID, args.VariableID)), nil
 		}
 
 		length := args.Length
@@ -1106,6 +1106,22 @@ func registerSecOpsTools(s *server.MCPServer, client *conjurClient) {
 				safeErr = strings.ReplaceAll(safeErr, newVal, "[REDACTED]")
 			}
 			return mcp.NewToolResultError(fmt.Sprintf("Error rotating secret in Conjur: %s", safeErr)), nil
+		}
+
+		// Update last_rotated_at annotation in policy after successful secret rotation
+		branch := "root"
+		varName := args.VariableID
+		if lastSlash := strings.LastIndex(args.VariableID, "/"); lastSlash != -1 {
+			branch = args.VariableID[:lastSlash]
+			varName = args.VariableID[lastSlash+1:]
+		}
+		nowUTC := time.Now().UTC().Format(time.RFC3339)
+		yamlDef := fmt.Sprintf("- !variable\n  id: %s\n  annotations:\n    last_rotated_at: %s\n",
+			strconv.Quote(varName),
+			strconv.Quote(nowUTC),
+		)
+		if _, loadErr := client.api.LoadPolicy(conjurapi.PolicyModePost, branch, strings.NewReader(yamlDef)); loadErr != nil {
+			_, _ = client.native.LoadPolicy(ctx, branch, "post", yamlDef)
 		}
 
 		return mcp.NewToolResultText(fmt.Sprintf("Success: Variable '%s' value was successfully rotated (%d bytes of entropy) in Conjur. The new value was not exposed in chat.", args.VariableID, length)), nil
@@ -1254,9 +1270,9 @@ func registerOnboardingTools(s *server.MCPServer, client *conjurClient) {
 
 	// D2. Rotate host API key
 	rotateHostKeyTool := mcp.NewTool("rotate_host_api_key",
-		mcp.WithDescription("Rotates a host API key in Conjur via PUT /authn/:account/api_key. Requires confirm: true. The new key is securely masked and not displayed in chat history."),
+		mcp.WithDescription("Rotates a host API key in Conjur via PUT /authn/:account/api_key. Always requires explicit user confirmation first. The new key is securely masked and not displayed in chat history."),
 		mcp.WithString("host_id", mcp.Required(), mcp.Description("Host identifier (e.g., test-host-1)")),
-		mcp.WithBoolean("confirm", mcp.Description("Must be set to true to confirm host API key rotation and prevent accidental execution.")),
+		mcp.WithBoolean("confirm", mcp.Description("CRITICAL RULE: Always pass 'false' (or omit) on the first call. Never set this to 'true' automatically. You MUST first ask the user in chat: 'Are you aware of the consequences of rotating this host API key? Reply yes to confirm.' Only pass 'true' AFTER the user explicitly replies 'yes' in their next message.")),
 	)
 	s.AddTool(rotateHostKeyTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args, err := parseArgs[RotateHostAPIKeyArgs](req)
@@ -1267,9 +1283,9 @@ func registerOnboardingTools(s *server.MCPServer, client *conjurClient) {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// Wymóg potwierdzenia operacji
+		// Require explicit user confirmation before rotating the host API key
 		if !args.Confirm {
-			return mcp.NewToolResultError(fmt.Sprintf("Refusal: Rotating API key for host '%s' is a destructive operation. Please explicitly ask the user for confirmation and retry with 'confirm: true'.", args.HostID)), nil
+			return mcp.NewToolResultError(fmt.Sprintf("CONFIRMATION REQUIRED: Rotating API key for host '%s' is a destructive operation that will immediately invalidate its current credentials. Stop and ask the user in chat: 'Are you aware of the consequences of rotating the API key for host %s? Please reply yes to confirm.' Do NOT call this tool with 'confirm: true' until the user explicitly replies 'yes'.", args.HostID, args.HostID)), nil
 		}
 
 		// SDK RotateAPIKey accepts role in "host:<id>" format (PUT /authn/:account/api_key)
